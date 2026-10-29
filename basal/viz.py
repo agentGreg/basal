@@ -25,7 +25,7 @@ from pathlib import Path
 import torch
 
 from .engine import default_device
-from .prompt import FORMATS, PREFILL
+from .prompt import FORMATS, PREFILL, RequestError
 from .run import to_request
 from .server import Server, certified, http_status, temperature, to_items
 from .server import parser as serve_parser
@@ -195,6 +195,12 @@ class Explainer:
             orders.append(dict(perm=perm, prompt=prompt, segments=segments(prompt, q["state"], question, opts, self.fmt),
                                n_tokens=len(ids), letters=list(codes[:k]), letter_ids=cids))
         t_tok = time.perf_counter() - t0
+        # the lens runs the whole prompt without truncation: a prompt over the context (the model's, or the engine's
+        # own limit, as basal-serve checks it) is refused before any forward
+        limit, n = getattr(self.srv, "context", None), max(map(len, toks))
+        if limit and n > limit[0]:
+            raise RequestError(f"basal-viz explains prompts within {limit[1]} ({limit[0]} tokens); this prompt has "
+                               f"{n} (basal-serve would truncate its state)")
 
         t0 = time.perf_counter()
         for o, ids in zip(orders, toks):

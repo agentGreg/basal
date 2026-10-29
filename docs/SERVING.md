@@ -203,9 +203,11 @@ basal-viz --model Remek/basal-2.0-mini --port 8080     # then open http://127.0.
 basal-viz --model Remek/basal-2.0-mini-MLX-8bit --mode mlx     # Apple Silicon: the MLX engine
 ```
 
-It runs `--mode mps` on Apple Silicon and `--mode eager` elsewhere (`--device`, `--orders 1|2`, `--calibration` as for
-`basal-serve`), and only the Llama-architecture models (basal-1.0, basal-1.5, basal-2.0; not basal-omni). It is meant
-for exploring, not serving: every question runs one extra forward per option order to record all layers.
+By default it runs the PyTorch engine, `--mode mps` on Apple Silicon and `--mode eager` elsewhere (`--device`,
+`--orders 1|2`, `--calibration` as for `basal-serve`); `--mode mlx` / `mlx-q8` (below) runs the MLX engine instead. It
+reads only the Llama-architecture models (basal-1.0, basal-1.5, basal-2.0; not basal-omni). It is meant for exploring,
+not serving: every question runs one extra forward per option order to record all layers, and a prompt over the
+context is refused (HTTP 422) instead of truncated.
 
 `--mode mlx` (the `-MLX-8bit` / `-MLX-fp4` exports or bf16 weights) and `--mode mlx-q8` read the layers of the MLX
 engine that `basal-serve` runs on a Mac, so the page shows where a quantised model's decision forms or moves. The

@@ -125,10 +125,12 @@ def test_viz_mlx_lens(tmp_path, quant):
     layers = list(be.lm.model.layers)
     tol = 0.05 if quant else 2e-4
     served = be.run(TOKS, LIDS)
+    assert len(served) == len(TOKS)
     for ids, codes, s in zip(TOKS, LIDS, served):
         ref, ref_top = torch_lens(m, "cpu", ids, codes)
         got, top = mlx_lens(be, ids, codes)
         assert len(got) == len(ref) == 2
+        assert all(len(p) == len(codes) for p in got + ref + [s]) and len(top) == len(ref_top) == 5
         for r, g in zip(ref, got):
             assert max(abs(x - y) for x, y in zip(r, g)) < tol
         assert max(abs(x - y) for x, y in zip(got[-1], s)) < 2e-4  # the page's last layer is the served readout

@@ -200,11 +200,19 @@ examples are in a drop-down, with the expected answer where the file has one.
 
 ```bash
 basal-viz --model Remek/basal-2.0-mini --port 8080     # then open http://127.0.0.1:8080
+basal-viz --model Remek/basal-2.0-mini-MLX-8bit --mode mlx     # Apple Silicon: the MLX engine
 ```
 
 It runs `--mode mps` on Apple Silicon and `--mode eager` elsewhere (`--device`, `--orders 1|2`, `--calibration` as for
 `basal-serve`), and only the Llama-architecture models (basal-1.0, basal-1.5, basal-2.0; not basal-omni). It is meant
 for exploring, not serving: every question runs one extra forward per option order to record all layers.
+
+`--mode mlx` (the `-MLX-8bit` / `-MLX-fp4` exports or bf16 weights) and `--mode mlx-q8` read the layers of the MLX
+engine that `basal-serve` runs on a Mac, so the page shows where a quantised model's decision forms or moves. The
+codes are read as that engine reads them (fp32 code rows, or the quantised head itself). On the page's 49 bundled
+requests (the 44 items with gold answers and 5 requests with several questions; Apple M5 Max, basal-2.0-mini and 4.5B,
+`-MLX-8bit` and `mlx-q8`), the page's answer differs from the served one by at most 2e-6 for a single question; a
+request with several questions differs by up to 0.02, as in `--mode mps`.
 
 ## Benchmark your GPU
 

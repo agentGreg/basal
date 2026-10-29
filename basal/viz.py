@@ -2,7 +2,10 @@
 
   basal-viz --model Remek/basal-2.0-mini --port 8080      then open http://127.0.0.1:8080
 
-The page runs a basal-serve Server in this process (--mode mps on Apple Silicon, eager elsewhere) and its PyTorch model.
+  basal-viz --model Remek/basal-2.0-mini-MLX-8bit --mode mlx      Apple Silicon: the MLX engine (mlx-q8 too)
+
+The page runs a basal-serve Server in this process (--mode mps on Apple Silicon, eager elsewhere, or --mode mlx /
+mlx-q8) and reads the layers of the model it serves.
 POST /api/explain takes a /v1/basal request body and returns, per question (per label for multi): the prompt of each
 option order the server asks (split into template / state / question / options / prefill; prompt format and option
 codes from the model's basal.json, one order by default for format-2 models), the shared-prefix packing of the orders,
@@ -59,6 +62,66 @@ def segments(prompt, state, question, options, fmt=1):
     return out
 
 
+MLX_MODES = ("mlx", "mlx-q8")
+
+
+@torch.no_grad()
+def torch_lens(model, dev, ids, codes):
+    """Forward with a hook on every decoder layer -> code distribution after each layer (fp32 code logits, as the
+    engines read them) and the top 5 tokens (ids, probabilities) of the full vocabulary at the last layer."""
+    mm, caught = model.model, []
+    hooks = [layer.register_forward_hook(lambda _m, _i, o: caught.append((o[0] if isinstance(o, tuple) else o)[0, -1]))
+             for layer in mm.layers]
+    try:
+        final = mm(input_ids=torch.tensor([ids], device=dev), use_cache=False).last_hidden_state[0, -1]
+    finally:
+        for h in hooks:
+            h.remove()
+    H = torch.stack([mm.norm(h[None])[0] for h in caught[:-1]] + [final])
+    W = model.lm_head.weight
+    per_layer = torch.softmax(H.float() @ W[codes].float().T, -1)
+    top = torch.log_softmax((H[-1] @ W.T).float(), -1).topk(5)  # what the model would write without the codes
+    return per_layer.tolist(), [(int(i), float(p.exp())) for p, i in zip(top.values, top.indices)]
+
+
+class _Catch:
+    """An MLX decoder layer that also keeps its output at the last position (attributes pass through to the layer)."""
+
+    def __init__(self, layer, out):
+        self.layer, self.out = layer, out
+
+    def __getattr__(self, name):
+        return getattr(self.layer, name)
+
+    def __call__(self, *args, **kw):
+        h = self.layer(*args, **kw)
+        self.out.append(h[0, -1])
+        return h
+
+
+def mlx_lens(be, ids, codes):
+    """torch_lens on the MLX backend that serves (--mode mlx / mlx-q8), on its thread: each decoder layer's output at
+    the answer position through the final norm, read as the backend reads the codes (MLXBackend._letters: fp32 code
+    rows, or the quantised head itself)."""
+    def run():
+        mx, mm, caught = be.mx, be.lm.model, []
+        layers = mm.layers
+        mm.layers = [_Catch(layer, caught) for layer in layers]
+        try:
+            final = mm(mx.array([ids]))[0, -1]
+        finally:
+            mm.layers = layers
+        H = mx.stack([mm.norm(h) for h in caught[:-1]] + [final])
+        per_layer = be._letters(H, [codes] * len(caught))
+        z = be._head(H[-1:])[0].astype(mx.float32)
+        if be.softcap:
+            z = mx.tanh(z / be.softcap) * be.softcap
+        top = mx.argsort(-z)[:5]
+        p = mx.exp(z[top] - mx.logsumexp(z))
+        return per_layer, list(zip(top.tolist(), p.tolist()))
+    return be.pool.submit(run).result()
+
+
 def packing(toks):
     """Tokens of the option orders' prompts: shared prefix (computed once in the packed row), each order's own tail,
     and the tokens of separate prompts."""
@@ -68,43 +131,52 @@ def packing(toks):
 
 class Explainer:
     def __init__(self, a):
-        dev = a.device or default_device()
-        mode = "mps" if dev == "mps" else "eager"  # the in-process PyTorch engines: the page reads the model's layers
-        args = ["--model", a.model, "--mode", mode, "--dtype", a.dtype] + (["--device", dev] if mode == "eager" else [])
+        mode = getattr(a, "mode", None)
+        if mode in MLX_MODES:  # the MLX engine of basal-serve: the page reads its layers
+            if a.device:
+                raise SystemExit(f"--device is for the PyTorch modes; --mode {mode} runs on the Mac's GPU")
+            args = ["--model", a.model, "--mode", mode]
+        else:
+            dev = a.device or default_device()
+            # the in-process PyTorch engines: the page reads the model's layers
+            mode = "mps" if dev == "mps" else "eager"
+            args = ["--model", a.model, "--mode", mode, "--dtype", a.dtype]
+            args += ["--device", dev] if mode == "eager" else []
         args += ["--orders", str(a.orders)] if a.orders else []
         args += ["--calibration", a.calibration] if a.calibration else []
         self.srv = Server(serve_parser().parse_args(args))
         be = self.srv.backend
-        self.tok, self.model, self.dev, self.fmt = be.tok, be.model, be.dev, self.srv.fmt
-        if getattr(self.model.config, "model_type", None) != "llama":
+        self.mlx = mode in MLX_MODES
+        self.tok, self.fmt = be.tok, self.srv.fmt
+        if self.mlx:
+            q = be.quantization
+            self.model, self.dev = None, "mlx"
+            arch, n_layers = be.config.get("model_type"), len(be.lm.model.layers)
+            # "8-bit"; "4-bit nvfp4" for an -MLX-fp4 export (quantisation mode other than affine); bf16 weights
+            dtype = (f"{q['bits']}-bit" + (f" {q['mode']}" if q.get("mode", "affine") != "affine" else "") if q
+                     else str(be.lm.model.embed_tokens.weight.dtype).rsplit(".", 1)[-1])
+        else:
+            self.model, self.dev, dtype = be.model, be.dev, a.dtype
+            arch, n_layers = getattr(self.model.config, "model_type", None), len(self.model.model.layers)
+        if arch != "llama":
             raise SystemExit(f"basal-viz reads the layers of the Llama-architecture models (basal-1.0, basal-1.5, "
-                             f"basal-2.0); {a.model} is {self.model.config.model_type!r}")
+                             f"basal-2.0); {a.model} is {arch!r}")
         self.name = self.srv.name
         self.lock = threading.Lock()
         cal = self.srv.cal
         self.thresholds = {t: {q: certified(cal, float(t), q) for q in ("choice", "noul", "score")} for t in TARGETS}
-        self.info = {"model": self.name, "device": str(self.dev), "dtype": a.dtype, "mode": mode,
-                     "layers": len(self.model.model.layers), "prompt_format": self.fmt, "orders": self.srv.orders,
+        self.info = {"model": self.name, "device": str(self.dev), "dtype": dtype, "mode": mode,
+                     "layers": n_layers, "prompt_format": self.fmt, "orders": self.srv.orders,
                      "thresholds": self.thresholds, "temperatures": cal.get("temperature_per_prim", {}),
                      "temperature_per_bucket": cal.get("temperature_per_bucket", {})}
 
-    @torch.no_grad()
     def lens(self, ids, codes):
-        """Forward with a hook on every decoder layer -> code distribution after each layer (fp32 code logits, as the
-        engines read them) and the top tokens of the full vocabulary at the last layer."""
-        mm, caught = self.model.model, []
-        hooks = [layer.register_forward_hook(lambda _m, _i, o: caught.append((o[0] if isinstance(o, tuple) else o)[0, -1]))
-                 for layer in mm.layers]
-        try:
-            final = mm(input_ids=torch.tensor([ids], device=self.dev), use_cache=False).last_hidden_state[0, -1]
-        finally:
-            for h in hooks:
-                h.remove()
-        H = torch.stack([mm.norm(h[None])[0] for h in caught[:-1]] + [final])
-        W = self.model.lm_head.weight
-        per_layer = torch.softmax(H.float() @ W[codes].float().T, -1)
-        top = torch.log_softmax((H[-1] @ W.T).float(), -1).topk(5)  # what the model would write without the codes
-        return per_layer.tolist(), [(self.tok.decode([int(i)]), float(p.exp())) for p, i in zip(top.values, top.indices)]
+        """Code distribution after each layer and the top tokens of the full vocabulary at the last layer."""
+        if self.mlx:
+            per_layer, top = mlx_lens(self.srv.backend, ids, codes)
+        else:
+            per_layer, top = torch_lens(self.model, self.dev, ids, codes)
+        return per_layer, [(self.tok.decode([i]), p) for i, p in top]
 
     def explain_branch(self, q, bi):
         question, options = q["branches"][bi]
@@ -200,7 +272,10 @@ def examples():
 def main():
     ap = argparse.ArgumentParser(description="basal decision visualiser (local web page)")
     ap.add_argument("--model", default="Remek/basal-2.0-mini", help="local directory or Hugging Face repo id")
-    ap.add_argument("--dtype", default="bfloat16")
+    ap.add_argument("--mode", default=None, choices=MLX_MODES,
+                    help="Apple Silicon: the MLX engine of basal-serve (the -MLX-8bit / -MLX-fp4 exports or bf16 "
+                         "weights; mlx-q8: 8-bit weights made at load time); default: the PyTorch engine of --device")
+    ap.add_argument("--dtype", default="bfloat16", help="the PyTorch modes")
     ap.add_argument("--device", default=None, choices=["cuda", "mps", "cpu"],
                     help=f"default here: {default_device()} (mps runs --mode mps, cuda and cpu --mode eager)")
     ap.add_argument("--orders", type=int, choices=[1, 2], default=None,
